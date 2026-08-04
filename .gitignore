@@ -1,0 +1,4 @@
+.env
+node_modules/
+local-trigger/config.json
+local-trigger/trigger.log
