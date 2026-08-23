@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import express from 'express';
 import tmi from 'tmi.js';
+import { REST } from '@discordjs/rest';
 
 // Rete di sicurezza: qualsiasi errore async sfuggito ai try/catch finisce
 // qui, loggato, invece di far crashare il processo senza traccia.
@@ -60,6 +61,9 @@ function currentVoteEntries() {
     .sort((a, b) => b.value - a.value);
 }
 
+// ---------- Client Discord (REST ufficiale, gestisce header/rate-limit da sola) ----------
+const discordRest = new REST({ version: '10' }).setToken(DISCORD_BOT_TOKEN);
+
 // ---------- Client Twitch ----------
 const twitchClient = new tmi.Client({
   identity: {
@@ -97,52 +101,35 @@ console.log('✅ Bot Twitch connesso al canale', process.env.TWITCH_CHANNEL);
 // Qui invece lo verifichiamo subito e logghiamo il risultato chiaramente.
 async function checkDiscordBot() {
   try {
-    const meRes = await fetch('https://discord.com/api/v10/users/@me', {
-      headers: { Authorization: `Bot ${DISCORD_BOT_TOKEN}` },
-    });
-
-    if (!meRes.ok) {
-      const body = await meRes.text().catch(() => '');
-      console.error(
-        `❌ DISCORD_BOT_TOKEN non valido (${meRes.status}). Controlla il token su ` +
-          `discord.com/developers/applications → tua app → Bot → Reset Token.`,
-        body
-      );
-      return;
-    }
-
-    const me = await meRes.json();
+    const me = await discordRest.get('/users/@me');
     console.log(`✅ Bot Discord autenticato come ${me.username}`);
+  } catch (err) {
+    console.error(
+      `❌ DISCORD_BOT_TOKEN non valido (${err.status || err.code || 'errore'}). Controlla il token su ` +
+        `discord.com/developers/applications → tua app → Bot → Reset Token.`,
+      err.message || err
+    );
+    return;
+  }
 
-    const channelRes = await fetch(`https://discord.com/api/v10/channels/${DISCORD_CHANNEL_ID}`, {
-      headers: { Authorization: `Bot ${DISCORD_BOT_TOKEN}` },
-    });
-
-    if (!channelRes.ok) {
-      const body = await channelRes.text().catch(() => '');
-      if (channelRes.status === 404) {
-        console.error(
-          `❌ DISCORD_CHANNEL_ID (${DISCORD_CHANNEL_ID}) non trovato: il bot non vede questo ` +
-            `canale. Controlla di aver copiato l'ID del CANALE (non del server) e che il bot ` +
-            `sia stato invitato nel server con quel canale visibile.`,
-          body
-        );
-      } else if (channelRes.status === 403) {
-        console.error(
-          `❌ Il bot Discord non ha il permesso di vedere/scrivere nel canale ${DISCORD_CHANNEL_ID}. ` +
-            `Controlla i permessi del canale o del ruolo assegnato al bot (serve "Send Messages").`,
-          body
-        );
-      } else {
-        console.error(`❌ Errore controllando l'accesso al canale Discord (${channelRes.status}):`, body);
-      }
-      return;
-    }
-
-    const channel = await channelRes.json();
+  try {
+    const channel = await discordRest.get(`/channels/${DISCORD_CHANNEL_ID}`);
     console.log(`✅ Bot Discord ha accesso al canale #${channel.name || DISCORD_CHANNEL_ID}`);
   } catch (err) {
-    console.error('❌ Errore di rete verificando il bot Discord all\'avvio:', err);
+    if (err.status === 404) {
+      console.error(
+        `❌ DISCORD_CHANNEL_ID (${DISCORD_CHANNEL_ID}) non trovato: il bot non vede questo ` +
+          `canale. Controlla di aver copiato l'ID del CANALE (non del server) e che il bot ` +
+          `sia stato invitato nel server con quel canale visibile.`
+      );
+    } else if (err.status === 403) {
+      console.error(
+        `❌ Il bot Discord non ha il permesso di vedere/scrivere nel canale ${DISCORD_CHANNEL_ID}. ` +
+          `Controlla i permessi del canale o del ruolo assegnato al bot (serve "Send Messages").`
+      );
+    } else {
+      console.error(`❌ Errore controllando l'accesso al canale Discord (${err.status || 'errore'}):`, err.message || err);
+    }
   }
 }
 
@@ -214,45 +201,21 @@ async function sendToDiscord({ url, title, average, count, voteEntries }) {
     timestamp: new Date().toISOString(),
   };
 
-  const endpoint = `https://discord.com/api/v10/channels/${DISCORD_CHANNEL_ID}/messages`;
   console.log('➡️  Invio messaggio a Discord...');
 
   try {
-    // Il bot ha un rate limit legato al proprio token, non all'IP del
-    // server: se per un motivo qualsiasi arrivasse comunque un 429,
-    // aspettiamo il tempo indicato da Discord e riproviamo una volta sola.
-    for (let attempt = 0; attempt < 2; attempt++) {
-      const res = await fetch(endpoint, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bot ${DISCORD_BOT_TOKEN}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ embeds: [embed] }),
-      });
-
-      if (res.ok) {
-        console.log('✅ Messaggio inviato su Discord con successo');
-        return;
-      }
-
-      if (res.status === 429 && attempt === 0) {
-        const body = await res.json().catch(() => ({}));
-        const waitSeconds = Number(body.retry_after || res.headers.get('retry-after') || 1);
-        console.warn(`⏳ Discord 429, riprovo tra ${waitSeconds}s...`);
-        await new Promise((r) => setTimeout(r, waitSeconds * 1000 + 200));
-        continue;
-      }
-
-      const body = await res.text().catch(() => '');
-      console.error(`❌ Discord ha rifiutato il messaggio (${res.status}):`, body);
-      return;
-    }
+    // @discordjs/rest gestisce da sola: header corretti (incluso lo
+    // User-Agent che Discord richiede), tracking dei bucket di
+    // rate-limit per endpoint, e retry automatico sui 429.
+    await discordRest.post(`/channels/${DISCORD_CHANNEL_ID}/messages`, {
+      body: { embeds: [embed] },
+    });
+    console.log('✅ Messaggio inviato su Discord con successo');
   } catch (err) {
-    // Non rilanciare l'errore: se questa fetch fallisce, non deve MAI
+    // Non rilanciare l'errore: se questa chiamata fallisce, non deve MAI
     // far crashare il processo (un errore async non gestito qui
     // ucciderebbe l'intero server su Node moderno).
-    console.error('❌ Errore di rete inviando il messaggio a Discord:', err);
+    console.error(`❌ Discord ha rifiutato il messaggio (${err.status || err.code || 'errore'}):`, err.message || err);
   }
 }
 
