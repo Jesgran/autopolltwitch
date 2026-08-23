@@ -72,25 +72,20 @@ const discordClient = new Client({
 });
 
 async function checkDiscordBot() {
-  // Ascolta l'evento 'ready' inviato dal Gateway Discord al completamento della connessione
-  discordClient.once('ready', async () => {
+  try {
+    await withTimeout(discordClient.login(DISCORD_BOT_TOKEN), 10000, 'login Discord');
     console.log(`✅ Bot Discord autenticato come ${discordClient.user.tag}`);
 
-    try {
-      const channel = await discordClient.channels.fetch(DISCORD_CHANNEL_ID);
-      if (channel) {
-        console.log(`✅ Bot Discord ha accesso al canale #${channel.name || DISCORD_CHANNEL_ID}`);
-      }
-    } catch (err) {
-      console.error(`❌ Impossibile accedere al canale Discord (${DISCORD_CHANNEL_ID}): ${err.message}`);
+    const channel = await withTimeout(
+      discordClient.channels.fetch(DISCORD_CHANNEL_ID),
+      10000,
+      'verifica canale Discord'
+    );
+    if (channel) {
+      console.log(`✅ Bot Discord ha accesso al canale #${channel.name || DISCORD_CHANNEL_ID}`);
     }
-  });
-
-  try {
-    console.log('🔄 Connessione al Gateway Discord in corso...');
-    await discordClient.login(DISCORD_BOT_TOKEN);
   } catch (err) {
-    console.error(`❌ Token Discord rifiutato o impossibile connettersi: ${err.message}`);
+    console.error(`❌ Errore connessione/accesso bot Discord: ${err.message || err}`);
   }
 }
 
@@ -240,6 +235,7 @@ app.post('/trigger', async (req, res) => {
     await twitchClient.say(
       process.env.TWITCH_CHANNEL,
       `/announce 🎵 Vota il brano da 1 a 10 scrivendo v seguito dal numero (es. v9), decimali ammessi con il punto (es. v6.7)! Avete ${POLL_DURATION_SECONDS} secondi ⏳`
+      `/announce 🎵 Vota il brano da 1 a 10 scrivendo v seguito dal numero, decimali ammessi (es. v9 o v6.7)! Avete ${POLL_DURATION_SECONDS} secondi ⏳`
     );
 
     broadcastOverlay({
