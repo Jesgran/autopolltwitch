@@ -1,16 +1,18 @@
 import 'dotenv/config';
 import express from 'express';
 import tmi from 'tmi.js';
-import { Client, GatewayIntentBits } from 'discord.js';
+import { REST } from '@discordjs/rest';
 
-// Rete di sicurezza per catch degli errori async
+// Rete di sicurezza: qualsiasi errore async sfuggito ai try/catch finisce
+// qui, loggato, invece di far crashare il processo senza traccia.
 process.on('unhandledRejection', (err) => {
-  console.error('❌ Unhandled rejection:', err);
+  console.error('❌ Unhandled rejection (il processo NON crasha, ma controlla questo errore):', err);
 });
 process.on('uncaughtException', (err) => {
-  console.error('❌ Uncaught exception:', err);
+  console.error('❌ Uncaught exception (il processo NON crasha, ma controlla questo errore):', err);
 });
 
+// Render fornisce automaticamente PORT: va sempre rispettato, non va hardcodato.
 const PORT = Number(process.env.PORT || 3939);
 const POLL_DURATION_SECONDS = Number(process.env.POLL_DURATION_SECONDS || 60);
 const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN;
@@ -22,20 +24,20 @@ if (!process.env.TWITCH_BOT_USERNAME || !process.env.TWITCH_OAUTH_TOKEN || !proc
   process.exit(1);
 }
 if (!DISCORD_BOT_TOKEN || !DISCORD_CHANNEL_ID) {
-  console.error('❌ Mancano DISCORD_BOT_TOKEN e/o DISCORD_CHANNEL_ID.');
+  console.error('❌ Mancano DISCORD_BOT_TOKEN e/o DISCORD_CHANNEL_ID (vedi README, sezione bot Discord).');
   process.exit(1);
 }
 if (!TRIGGER_SECRET) {
-  console.error('❌ Manca TRIGGER_SECRET.');
+  console.error('❌ Manca TRIGGER_SECRET: serve per proteggere /trigger, che sarà un URL pubblico su internet.');
   process.exit(1);
 }
 
 // ---------- Stato del sondaggio ----------
 let pollActive = false;
-let votes = new Map();
-let pollInfo = null;
+let votes = new Map(); // username (lowercase) -> numero votato
+let pollInfo = null; // { title, url, startedAt, durationMs }
 
-// ---------- Overlay: client SSE ----------
+// ---------- Overlay: client SSE connessi ----------
 const overlayClients = new Set();
 
 function broadcastOverlay(payload) {
@@ -52,12 +54,17 @@ function currentStats() {
   return { count, average };
 }
 
+// Lista votanti in ordine decrescente di voto: [{ user, value }, ...]
 function currentVoteEntries() {
   return Array.from(votes.entries())
     .map(([user, value]) => ({ user, value }))
     .sort((a, b) => b.value - a.value);
 }
 
+// Avvolge una promise con un timeout: se non risponde entro "ms",
+// la promise viene rigettata invece di restare appesa per sempre.
+// Non annulla la richiesta di rete sottostante, ma ci permette di NON
+// bloccare mai l'avvio del server o loggare "non succede niente".
 function withTimeout(promise, ms, label) {
   let timeoutId;
   const timeout = new Promise((_, reject) => {
@@ -66,29 +73,52 @@ function withTimeout(promise, ms, label) {
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timeoutId));
 }
 
-// ---------- Client Discord (WebSocket via discord.js) ----------
-const discordClient = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages]
-});
+// ---------- Client Discord (REST ufficiale, gestisce header/rate-limit da sola) ----------
+const discordRest = new REST({ version: '10' }).setToken(DISCORD_BOT_TOKEN);
 
+// Verifica il bot Discord: token valido + accesso al canale. Chiamata
+// DOPO che il server è già in ascolto, mai prima (vedi app.listen sotto).
 async function checkDiscordBot() {
   try {
-    await withTimeout(discordClient.login(DISCORD_BOT_TOKEN), 10000, 'login Discord');
-    console.log(`✅ Bot Discord autenticato come ${discordClient.user.tag}`);
+    const me = await withTimeout(discordRest.get('/users/@me'), 10000, 'verifica token Discord');
+    console.log(`✅ Bot Discord autenticato come ${me.username}`);
+  } catch (err) {
+    console.error(
+      `❌ DISCORD_BOT_TOKEN non valido o Discord irraggiungibile (${err.status || err.code || err.message || 'errore'}). ` +
+        `Controlla il token su discord.com/developers/applications → tua app → Bot → Reset Token.`
+    );
+    return;
+  }
 
+  try {
     const channel = await withTimeout(
-      discordClient.channels.fetch(DISCORD_CHANNEL_ID),
+      discordRest.get(`/channels/${DISCORD_CHANNEL_ID}`),
       10000,
       'verifica canale Discord'
     );
-    if (channel) {
-      console.log(`✅ Bot Discord ha accesso al canale #${channel.name || DISCORD_CHANNEL_ID}`);
-    }
+    console.log(`✅ Bot Discord ha accesso al canale #${channel.name || DISCORD_CHANNEL_ID}`);
   } catch (err) {
-    console.error(`❌ Errore connessione/accesso bot Discord: ${err.message || err}`);
+    if (err.status === 404) {
+      console.error(
+        `❌ DISCORD_CHANNEL_ID (${DISCORD_CHANNEL_ID}) non trovato: il bot non vede questo ` +
+          `canale. Controlla di aver copiato l'ID del CANALE (non del server) e che il bot ` +
+          `sia stato invitato nel server con quel canale visibile.`
+      );
+    } else if (err.status === 403) {
+      console.error(
+        `❌ Il bot Discord non ha il permesso di vedere/scrivere nel canale ${DISCORD_CHANNEL_ID}. ` +
+          `Controlla i permessi del canale o del ruolo assegnato al bot (serve "Send Messages").`
+      );
+    } else {
+      console.error(
+        `❌ Errore controllando l'accesso al canale Discord (${err.status || err.message || 'errore'})`
+      );
+    }
   }
 }
 
+// I campi degli embed Discord hanno un limite di 1024 caratteri: se i
+// votanti sono tanti, spezzo la lista in più campi "Voti (1/2)", "Voti (2/2)" ecc.
 function chunkVotersList(voteEntries, maxChars = 1000) {
   const lines = voteEntries.map((v) => `${v.user}: **${v.value}**`);
   const chunks = [];
@@ -129,7 +159,7 @@ async function sendToDiscord({ url, title, average, count, voteEntries }) {
       count > 0
         ? `⭐ **Voto medio: ${average.toFixed(1)} / 10** (${count} vot${count === 1 ? 'o' : 'i'})`
         : '⭐ Nessun voto ricevuto per questo brano.',
-    color: 0x9146ff,
+    color: 0x9146ff, // viola Twitch
     fields,
     timestamp: new Date().toISOString(),
   };
@@ -137,23 +167,24 @@ async function sendToDiscord({ url, title, average, count, voteEntries }) {
   console.log('➡️  Invio messaggio a Discord...');
 
   try {
-    const channel = await discordClient.channels.fetch(DISCORD_CHANNEL_ID);
-    if (channel) {
-      await withTimeout(
-        channel.send({ embeds: [embed] }),
-        10000,
-        'invio messaggio Discord'
-      );
-      console.log('✅ Messaggio inviato su Discord con successo');
-    } else {
-      console.error('❌ Canale Discord non trovato o inaccessibile.');
-    }
+    // @discordjs/rest gestisce da sola: header corretti (incluso lo
+    // User-Agent che Discord richiede), tracking dei bucket di
+    // rate-limit per endpoint, e retry automatico sui 429.
+    await withTimeout(
+      discordRest.post(`/channels/${DISCORD_CHANNEL_ID}/messages`, { body: { embeds: [embed] } }),
+      10000,
+      'invio messaggio Discord'
+    );
+    console.log('✅ Messaggio inviato su Discord con successo');
   } catch (err) {
-    console.error(`❌ Discord ha rifiutato il messaggio: ${err.message || err}`);
+    // Non rilanciare l'errore: se questa chiamata fallisce, non deve MAI
+    // far crashare il processo (un errore async non gestito qui
+    // ucciderebbe l'intero server su Node moderno).
+    console.error(`❌ Discord ha rifiutato il messaggio (${err.status || err.message || 'errore'})`);
   }
 }
 
-// ---------- Titolo YouTube via oEmbed ----------
+// ---------- Titolo YouTube via oEmbed (più pulito del titolo della tab) ----------
 async function getYoutubeTitle(url) {
   try {
     const isYoutube = /youtube\.com\/watch|youtu\.be\//.test(url);
@@ -189,13 +220,13 @@ twitchClient.on('message', (channel, tags, message, self) => {
   const user = (tags['display-name'] || tags.username || '').toLowerCase();
   if (!user) return;
 
-  votes.set(user, value);
+  votes.set(user, value); // un voto per utente, l'ultimo scritto vince
 
   const { count, average } = currentStats();
   broadcastOverlay({ type: 'vote_update', count, average });
 });
 
-// ---------- Server HTTP ----------
+// ---------- Server HTTP per il trigger locale ----------
 const app = express();
 app.use(express.json());
 
@@ -231,11 +262,9 @@ app.post('/trigger', async (req, res) => {
       durationMs: POLL_DURATION_SECONDS * 1000,
     };
 
-    // Uso di /announce per evidenziare il messaggio in chat
     await twitchClient.say(
       process.env.TWITCH_CHANNEL,
-      `/announce 🎵 Vota il brano da 1 a 10 scrivendo v seguito dal numero (es. v9), decimali ammessi con il punto (es. v6.7)! Avete ${POLL_DURATION_SECONDS} secondi ⏳`
-      `/announce 🎵 Vota il brano da 1 a 10 scrivendo v seguito dal numero, decimali ammessi (es. v9 o v6.7)! Avete ${POLL_DURATION_SECONDS} secondi ⏳`
+      `🎵 Vota il brano da 1 a 10 scrivendo v seguito dal numero, decimali ammessi (es. v9 o v6.7)! Avete ${POLL_DURATION_SECONDS} secondi ⏳`
     );
 
     broadcastOverlay({
@@ -248,6 +277,11 @@ app.post('/trigger', async (req, res) => {
     res.status(200).send('Sondaggio avviato');
 
     setTimeout(async () => {
+      // TUTTO qui dentro è avvolto in try/catch: se qualcosa fallisce
+      // (chat, Discord, qualsiasi cosa) il server NON deve crashare.
+      // Un errore async non gestito in un setTimeout può far terminare
+      // l'intero processo Node — e su Render questo si traduce in un
+      // riavvio silenzioso, senza che nessuno se ne accorga.
       try {
         pollActive = false;
         pollInfo = null;
@@ -255,17 +289,13 @@ app.post('/trigger', async (req, res) => {
         const { count, average } = currentStats();
         const voteEntries = currentVoteEntries();
 
-        // Uso di /announce per il risultato del sondaggio
         if (count > 0) {
           await twitchClient.say(
             process.env.TWITCH_CHANNEL,
-            `/announce 📊 Voto medio: ${average.toFixed(1)}/10 su ${count} vot${count === 1 ? 'o' : 'i'}!`
+            `📊 Voto medio: ${average.toFixed(1)}/10 su ${count} vot${count === 1 ? 'o' : 'i'}!`
           );
         } else {
-          await twitchClient.say(
-            process.env.TWITCH_CHANNEL,
-            `/announce 📊 Nessun voto ricevuto stavolta 😅`
-          );
+          await twitchClient.say(process.env.TWITCH_CHANNEL, '📊 Nessun voto ricevuto stavolta 😅');
         }
 
         broadcastOverlay({ type: 'poll_end', count, average });
@@ -286,11 +316,12 @@ app.get('/', (req, res) => {
   res.send('Twitch Poll Bot attivo.');
 });
 
+// Endpoint leggero per i servizi di keep-alive (es. UptimeRobot / cron-job.org)
 app.get('/health', (req, res) => {
   res.status(200).send('ok');
 });
 
-// ---------- Stream SSE per overlay ----------
+// ---------- Stream di eventi live (SSE) per l'overlay ----------
 app.get('/events', (req, res) => {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
@@ -301,6 +332,7 @@ app.get('/events', (req, res) => {
 
   overlayClients.add(res);
 
+  // Se un overlay si collega mentre un sondaggio è già in corso, aggiornalo subito
   if (pollActive && pollInfo) {
     const { count, average } = currentStats();
     const secondsLeft = Math.max(
@@ -324,7 +356,7 @@ app.get('/events', (req, res) => {
   });
 });
 
-// ---------- Page Overlay OBS ----------
+// ---------- Pagina overlay da usare come Browser Source in OBS ----------
 app.get('/overlay', (req, res) => {
   res.type('html').send(`<!DOCTYPE html>
 <html lang="it">
@@ -460,7 +492,14 @@ app.get('/overlay', (req, res) => {
 </html>`);
 });
 
-// ---------- Avvio ----------
+// ---------- Avvio del server ----------
+// IMPORTANTE: la porta si apre PRIMA di qualsiasi connessione a Twitch o
+// Discord. Render considera il servizio "vivo" solo quando la porta è
+// aperta: se una chiamata di rete verso servizi esterni si blocca prima
+// di questa riga, Render resta in attesa per sempre ("No open ports
+// detected") anche se il resto del codice è corretto. Twitch e Discord
+// si connettono DOPO, in modo che un loro eventuale blocco non impedisca
+// mai al server di avviarsi.
 app.listen(PORT, () => {
   console.log(`✅ Server in ascolto su http://localhost:${PORT}`);
   console.log(`   Punta lo Stream Deck su: http://localhost:${PORT}/trigger`);
