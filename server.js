@@ -90,6 +90,64 @@ console.log('✅ Bot Twitch connesso al canale', process.env.TWITCH_CHANNEL);
 // Da qui in poi il bot resta connesso in permanenza: su Render non serve
 // che nessuno lo avvii manualmente ogni volta che si va in live.
 
+// ---------- Verifica del bot Discord all'avvio ----------
+// Il bot Discord non ha una "connessione" persistente (usiamo solo REST,
+// niente gateway), quindi senza questo controllo non sapresti se il
+// token/canale sono corretti finché non finisce il primo sondaggio.
+// Qui invece lo verifichiamo subito e logghiamo il risultato chiaramente.
+async function checkDiscordBot() {
+  try {
+    const meRes = await fetch('https://discord.com/api/v10/users/@me', {
+      headers: { Authorization: `Bot ${DISCORD_BOT_TOKEN}` },
+    });
+
+    if (!meRes.ok) {
+      const body = await meRes.text().catch(() => '');
+      console.error(
+        `❌ DISCORD_BOT_TOKEN non valido (${meRes.status}). Controlla il token su ` +
+          `discord.com/developers/applications → tua app → Bot → Reset Token.`,
+        body
+      );
+      return;
+    }
+
+    const me = await meRes.json();
+    console.log(`✅ Bot Discord autenticato come ${me.username}`);
+
+    const channelRes = await fetch(`https://discord.com/api/v10/channels/${DISCORD_CHANNEL_ID}`, {
+      headers: { Authorization: `Bot ${DISCORD_BOT_TOKEN}` },
+    });
+
+    if (!channelRes.ok) {
+      const body = await channelRes.text().catch(() => '');
+      if (channelRes.status === 404) {
+        console.error(
+          `❌ DISCORD_CHANNEL_ID (${DISCORD_CHANNEL_ID}) non trovato: il bot non vede questo ` +
+            `canale. Controlla di aver copiato l'ID del CANALE (non del server) e che il bot ` +
+            `sia stato invitato nel server con quel canale visibile.`,
+          body
+        );
+      } else if (channelRes.status === 403) {
+        console.error(
+          `❌ Il bot Discord non ha il permesso di vedere/scrivere nel canale ${DISCORD_CHANNEL_ID}. ` +
+            `Controlla i permessi del canale o del ruolo assegnato al bot (serve "Send Messages").`,
+          body
+        );
+      } else {
+        console.error(`❌ Errore controllando l'accesso al canale Discord (${channelRes.status}):`, body);
+      }
+      return;
+    }
+
+    const channel = await channelRes.json();
+    console.log(`✅ Bot Discord ha accesso al canale #${channel.name || DISCORD_CHANNEL_ID}`);
+  } catch (err) {
+    console.error('❌ Errore di rete verificando il bot Discord all\'avvio:', err);
+  }
+}
+
+await checkDiscordBot();
+
 // ---------- Titolo YouTube via oEmbed (più pulito del titolo della tab) ----------
 async function getYoutubeTitle(url) {
   try {
@@ -157,6 +215,7 @@ async function sendToDiscord({ url, title, average, count, voteEntries }) {
   };
 
   const endpoint = `https://discord.com/api/v10/channels/${DISCORD_CHANNEL_ID}/messages`;
+  console.log('➡️  Invio messaggio a Discord...');
 
   try {
     // Il bot ha un rate limit legato al proprio token, non all'IP del
@@ -172,7 +231,10 @@ async function sendToDiscord({ url, title, average, count, voteEntries }) {
         body: JSON.stringify({ embeds: [embed] }),
       });
 
-      if (res.ok) return;
+      if (res.ok) {
+        console.log('✅ Messaggio inviato su Discord con successo');
+        return;
+      }
 
       if (res.status === 429 && attempt === 0) {
         const body = await res.json().catch(() => ({}));
