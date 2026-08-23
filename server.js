@@ -13,16 +13,17 @@ process.on('uncaughtException', (err) => {
 
 // Render fornisce automaticamente PORT: va sempre rispettato, non va hardcodato.
 const PORT = Number(process.env.PORT || 3939);
-const POLL_DURATION_SECONDS = Number(process.env.POLL_DURATION_SECONDS || 120);
-const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
+const POLL_DURATION_SECONDS = Number(process.env.POLL_DURATION_SECONDS || 60);
+const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN;
+const DISCORD_CHANNEL_ID = process.env.DISCORD_CHANNEL_ID;
 const TRIGGER_SECRET = process.env.TRIGGER_SECRET;
 
 if (!process.env.TWITCH_BOT_USERNAME || !process.env.TWITCH_OAUTH_TOKEN || !process.env.TWITCH_CHANNEL) {
   console.error('❌ Mancano variabili Twitch (TWITCH_BOT_USERNAME, TWITCH_OAUTH_TOKEN, TWITCH_CHANNEL).');
   process.exit(1);
 }
-if (!DISCORD_WEBHOOK_URL) {
-  console.error('❌ Manca DISCORD_WEBHOOK_URL.');
+if (!DISCORD_BOT_TOKEN || !DISCORD_CHANNEL_ID) {
+  console.error('❌ Mancano DISCORD_BOT_TOKEN e/o DISCORD_CHANNEL_ID (vedi README, sezione bot Discord).');
   process.exit(1);
 }
 if (!TRIGGER_SECRET) {
@@ -155,22 +156,41 @@ async function sendToDiscord({ url, title, average, count, voteEntries }) {
     timestamp: new Date().toISOString(),
   };
 
-  try {
-    const res = await fetch(DISCORD_WEBHOOK_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ embeds: [embed] }),
-    });
+  const endpoint = `https://discord.com/api/v10/channels/${DISCORD_CHANNEL_ID}/messages`;
 
-    if (!res.ok) {
+  try {
+    // Il bot ha un rate limit legato al proprio token, non all'IP del
+    // server: se per un motivo qualsiasi arrivasse comunque un 429,
+    // aspettiamo il tempo indicato da Discord e riproviamo una volta sola.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bot ${DISCORD_BOT_TOKEN}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ embeds: [embed] }),
+      });
+
+      if (res.ok) return;
+
+      if (res.status === 429 && attempt === 0) {
+        const body = await res.json().catch(() => ({}));
+        const waitSeconds = Number(body.retry_after || res.headers.get('retry-after') || 1);
+        console.warn(`⏳ Discord 429, riprovo tra ${waitSeconds}s...`);
+        await new Promise((r) => setTimeout(r, waitSeconds * 1000 + 200));
+        continue;
+      }
+
       const body = await res.text().catch(() => '');
-      console.error(`❌ Discord ha rifiutato il webhook (${res.status}):`, body);
+      console.error(`❌ Discord ha rifiutato il messaggio (${res.status}):`, body);
+      return;
     }
   } catch (err) {
     // Non rilanciare l'errore: se questa fetch fallisce, non deve MAI
     // far crashare il processo (un errore async non gestito qui
     // ucciderebbe l'intero server su Node moderno).
-    console.error('❌ Errore di rete inviando il webhook Discord:', err);
+    console.error('❌ Errore di rete inviando il messaggio a Discord:', err);
   }
 }
 
@@ -391,7 +411,7 @@ app.get('/overlay', (req, res) => {
   const barFill = document.getElementById('barFill');
   const timerEl = document.getElementById('timer');
 
-  let durationSeconds = 120;
+  let durationSeconds = 60;
   let secondsLeft = 0;
   let countdownInterval = null;
 
