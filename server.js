@@ -72,20 +72,25 @@ const discordClient = new Client({
 });
 
 async function checkDiscordBot() {
-  try {
-    await withTimeout(discordClient.login(DISCORD_BOT_TOKEN), 10000, 'login Discord');
+  // Ascolta l'evento 'ready' inviato dal Gateway Discord al completamento della connessione
+  discordClient.once('ready', async () => {
     console.log(`✅ Bot Discord autenticato come ${discordClient.user.tag}`);
 
-    const channel = await withTimeout(
-      discordClient.channels.fetch(DISCORD_CHANNEL_ID),
-      10000,
-      'verifica canale Discord'
-    );
-    if (channel) {
-      console.log(`✅ Bot Discord ha accesso al canale #${channel.name || DISCORD_CHANNEL_ID}`);
+    try {
+      const channel = await discordClient.channels.fetch(DISCORD_CHANNEL_ID);
+      if (channel) {
+        console.log(`✅ Bot Discord ha accesso al canale #${channel.name || DISCORD_CHANNEL_ID}`);
+      }
+    } catch (err) {
+      console.error(`❌ Impossibile accedere al canale Discord (${DISCORD_CHANNEL_ID}): ${err.message}`);
     }
+  });
+
+  try {
+    console.log('🔄 Connessione al Gateway Discord in corso...');
+    await discordClient.login(DISCORD_BOT_TOKEN);
   } catch (err) {
-    console.error(`❌ Errore connessione/accesso bot Discord: ${err.message || err}`);
+    console.error(`❌ Token Discord rifiutato o impossibile connettersi: ${err.message}`);
   }
 }
 
