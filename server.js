@@ -24,6 +24,24 @@ if (!TRIGGER_SECRET) {
 // ---------- Stato del sondaggio ----------
 let pollActive = false;
 let votes = new Map(); // username (lowercase) -> numero votato
+let pollInfo = null; // { title, url, startedAt, durationMs }
+
+// ---------- Overlay: client SSE connessi ----------
+const overlayClients = new Set();
+
+function broadcastOverlay(payload) {
+  const data = `data: ${JSON.stringify(payload)}\n\n`;
+  for (const res of overlayClients) {
+    res.write(data);
+  }
+}
+
+function currentStats() {
+  const values = Array.from(votes.values());
+  const count = values.length;
+  const average = count > 0 ? values.reduce((a, b) => a + b, 0) / count : 0;
+  return { count, average };
+}
 
 // ---------- Client Twitch ----------
 const twitchClient = new tmi.Client({
@@ -37,14 +55,17 @@ const twitchClient = new tmi.Client({
 twitchClient.on('message', (channel, tags, message, self) => {
   if (self || !pollActive) return;
 
-  const match = message.trim().match(/^v(10|[1-9])$/i);
+  const match = message.trim().match(/^v(10(?:\.0)?|[1-9](?:\.\d)?)$/i);
   if (!match) return;
 
-  const value = Number(match[1]);
+  const value = Number.parseFloat(match[1]);
   const user = (tags['display-name'] || tags.username || '').toLowerCase();
   if (!user) return;
 
   votes.set(user, value); // un voto per utente, l'ultimo scritto vince
+
+  const { count, average } = currentStats();
+  broadcastOverlay({ type: 'vote_update', count, average });
 });
 
 await twitchClient.connect();
@@ -111,27 +132,39 @@ app.post('/trigger', async (req, res) => {
   }
 
   try {
-    const safariUrl = (req.body?.url || '').trim();
-    const safariTitle = (req.body?.title || '').trim();
-    const youtubeTitle = await getYoutubeTitle(safariUrl);
-    const finalTitle = youtubeTitle || safariTitle || safariUrl || 'Traccia in ascolto';
+    const browserUrl = (req.body?.url || '').trim();
+    const browserTitle = (req.body?.title || '').trim();
+    const youtubeTitle = await getYoutubeTitle(browserUrl);
+    const finalTitle = youtubeTitle || browserTitle || browserUrl || 'Traccia in ascolto';
 
     votes = new Map();
     pollActive = true;
+    pollInfo = {
+      title: finalTitle,
+      url: browserUrl,
+      startedAt: Date.now(),
+      durationMs: POLL_DURATION_SECONDS * 1000,
+    };
 
     await twitchClient.say(
       process.env.TWITCH_CHANNEL,
-      `🎵 Vota il brano da 1 a 10 scrivendo v seguito dal numero (es. v9)! Avete ${POLL_DURATION_SECONDS} secondi ⏳`
+      `🎵 Vota il brano da 1 a 10 scrivendo v seguito dal numero, decimali ammessi (es. v9 o v6.7)! Avete ${POLL_DURATION_SECONDS} secondi ⏳`
     );
+
+    broadcastOverlay({
+      type: 'poll_start',
+      title: finalTitle,
+      url: browserUrl,
+      durationSeconds: POLL_DURATION_SECONDS,
+    });
 
     res.status(200).send('Sondaggio avviato');
 
     setTimeout(async () => {
       pollActive = false;
+      pollInfo = null;
 
-      const values = Array.from(votes.values());
-      const count = values.length;
-      const average = count > 0 ? values.reduce((a, b) => a + b, 0) / count : 0;
+      const { count, average } = currentStats();
 
       if (count > 0) {
         await twitchClient.say(
@@ -142,7 +175,9 @@ app.post('/trigger', async (req, res) => {
         await twitchClient.say(process.env.TWITCH_CHANNEL, '📊 Nessun voto ricevuto stavolta 😅');
       }
 
-      await sendToDiscord({ url: safariUrl, title: finalTitle, average, count });
+      broadcastOverlay({ type: 'poll_end', count, average });
+
+      await sendToDiscord({ url: browserUrl, title: finalTitle, average, count });
     }, POLL_DURATION_SECONDS * 1000);
   } catch (err) {
     pollActive = false;
@@ -158,6 +193,177 @@ app.get('/', (req, res) => {
 // Endpoint leggero per i servizi di keep-alive (es. UptimeRobot / cron-job.org)
 app.get('/health', (req, res) => {
   res.status(200).send('ok');
+});
+
+// ---------- Stream di eventi live (SSE) per l'overlay ----------
+app.get('/events', (req, res) => {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive',
+  });
+  res.write('\n');
+
+  overlayClients.add(res);
+
+  // Se un overlay si collega mentre un sondaggio è già in corso, aggiornalo subito
+  if (pollActive && pollInfo) {
+    const { count, average } = currentStats();
+    const secondsLeft = Math.max(
+      0,
+      Math.round((pollInfo.startedAt + pollInfo.durationMs - Date.now()) / 1000)
+    );
+    res.write(
+      `data: ${JSON.stringify({
+        type: 'poll_start',
+        title: pollInfo.title,
+        url: pollInfo.url,
+        durationSeconds: Math.round(pollInfo.durationMs / 1000),
+        secondsLeft,
+      })}\n\n`
+    );
+    res.write(`data: ${JSON.stringify({ type: 'vote_update', count, average })}\n\n`);
+  }
+
+  req.on('close', () => {
+    overlayClients.delete(res);
+  });
+});
+
+// ---------- Pagina overlay da usare come Browser Source in OBS ----------
+app.get('/overlay', (req, res) => {
+  res.type('html').send(`<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="UTF-8">
+<title>Overlay Sondaggio</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: transparent;
+    font-family: 'Segoe UI', Arial, sans-serif;
+    overflow: hidden;
+  }
+  #card {
+    display: none;
+    width: 480px;
+    padding: 20px 24px;
+    border-radius: 16px;
+    background: rgba(20, 12, 30, 0.85);
+    color: #fff;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+  }
+  #title {
+    font-size: 20px;
+    font-weight: 700;
+    margin-bottom: 8px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  #row {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    margin-bottom: 10px;
+  }
+  #average {
+    font-size: 42px;
+    font-weight: 800;
+    color: #9146ff;
+  }
+  #count {
+    font-size: 16px;
+    opacity: 0.8;
+  }
+  #barBg {
+    width: 100%;
+    height: 10px;
+    border-radius: 5px;
+    background: rgba(255,255,255,0.15);
+    overflow: hidden;
+  }
+  #barFill {
+    height: 100%;
+    width: 100%;
+    background: linear-gradient(90deg, #9146ff, #ff5fa2);
+    transition: width 1s linear;
+  }
+  #timer {
+    margin-top: 6px;
+    font-size: 14px;
+    opacity: 0.7;
+    text-align: right;
+  }
+</style>
+</head>
+<body>
+<div id="card">
+  <div id="title">🎵 ...</div>
+  <div id="row">
+    <span id="average">0.0</span>
+    <span id="count">0 voti</span>
+  </div>
+  <div id="barBg"><div id="barFill"></div></div>
+  <div id="timer"></div>
+</div>
+
+<script>
+  const card = document.getElementById('card');
+  const titleEl = document.getElementById('title');
+  const averageEl = document.getElementById('average');
+  const countEl = document.getElementById('count');
+  const barFill = document.getElementById('barFill');
+  const timerEl = document.getElementById('timer');
+
+  let durationSeconds = 60;
+  let secondsLeft = 0;
+  let countdownInterval = null;
+
+  function startCountdown() {
+    clearInterval(countdownInterval);
+    countdownInterval = setInterval(() => {
+      secondsLeft = Math.max(0, secondsLeft - 1);
+      timerEl.textContent = secondsLeft + 's';
+      barFill.style.width = Math.max(0, (secondsLeft / durationSeconds) * 100) + '%';
+      if (secondsLeft <= 0) clearInterval(countdownInterval);
+    }, 1000);
+  }
+
+  const source = new EventSource('/events');
+
+  source.onmessage = (e) => {
+    const data = JSON.parse(e.data);
+
+    if (data.type === 'poll_start') {
+      card.style.display = 'block';
+      titleEl.textContent = '🎵 ' + data.title;
+      durationSeconds = data.durationSeconds;
+      secondsLeft = data.secondsLeft ?? data.durationSeconds;
+      averageEl.textContent = '0.0';
+      countEl.textContent = '0 voti';
+      barFill.style.width = '100%';
+      timerEl.textContent = secondsLeft + 's';
+      startCountdown();
+    }
+
+    if (data.type === 'vote_update') {
+      averageEl.textContent = data.average.toFixed(1);
+      countEl.textContent = data.count + (data.count === 1 ? ' voto' : ' voti');
+    }
+
+    if (data.type === 'poll_end') {
+      averageEl.textContent = data.average.toFixed(1);
+      countEl.textContent = data.count + (data.count === 1 ? ' voto' : ' voti');
+      timerEl.textContent = 'Chiuso';
+      clearInterval(countdownInterval);
+      setTimeout(() => { card.style.display = 'none'; }, 8000);
+    }
+  };
+</script>
+</body>
+</html>`);
 });
 
 app.listen(PORT, () => {
