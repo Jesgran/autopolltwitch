@@ -2,9 +2,18 @@ import 'dotenv/config';
 import express from 'express';
 import tmi from 'tmi.js';
 
+// Rete di sicurezza: qualsiasi errore async sfuggito ai try/catch finisce
+// qui, loggato, invece di far crashare il processo senza traccia.
+process.on('unhandledRejection', (err) => {
+  console.error('❌ Unhandled rejection (il processo NON crasha, ma controlla questo errore):', err);
+});
+process.on('uncaughtException', (err) => {
+  console.error('❌ Uncaught exception (il processo NON crasha, ma controlla questo errore):', err);
+});
+
 // Render fornisce automaticamente PORT: va sempre rispettato, non va hardcodato.
 const PORT = Number(process.env.PORT || 3939);
-const POLL_DURATION_SECONDS = Number(process.env.POLL_DURATION_SECONDS || 60);
+const POLL_DURATION_SECONDS = Number(process.env.POLL_DURATION_SECONDS || 120);
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
 const TRIGGER_SECRET = process.env.TRIGGER_SECRET;
 
@@ -41,6 +50,13 @@ function currentStats() {
   const count = values.length;
   const average = count > 0 ? values.reduce((a, b) => a + b, 0) / count : 0;
   return { count, average };
+}
+
+// Lista votanti in ordine decrescente di voto: [{ user, value }, ...]
+function currentVoteEntries() {
+  return Array.from(votes.entries())
+    .map(([user, value]) => ({ user, value }))
+    .sort((a, b) => b.value - a.value);
 }
 
 // ---------- Client Twitch ----------
@@ -91,7 +107,42 @@ async function getYoutubeTitle(url) {
 }
 
 // ---------- Invio a Discord ----------
-async function sendToDiscord({ url, title, average, count }) {
+
+// I campi degli embed Discord hanno un limite di 1024 caratteri: se i
+// votanti sono tanti, spezzo la lista in più campi "Voti (1/2)", "Voti (2/2)" ecc.
+function chunkVotersList(voteEntries, maxChars = 1000) {
+  const lines = voteEntries.map((v) => `${v.user}: **${v.value}**`);
+  const chunks = [];
+  let current = '';
+
+  for (const line of lines) {
+    const candidate = current ? `${current}\n${line}` : line;
+    if (candidate.length > maxChars) {
+      if (current) chunks.push(current);
+      current = line;
+    } else {
+      current = candidate;
+    }
+  }
+  if (current) chunks.push(current);
+
+  return chunks;
+}
+
+async function sendToDiscord({ url, title, average, count, voteEntries }) {
+  const fields = [];
+
+  if (count > 0) {
+    const chunks = chunkVotersList(voteEntries);
+    chunks.forEach((chunk, i) => {
+      fields.push({
+        name: chunks.length > 1 ? `Voti (${i + 1}/${chunks.length})` : 'Voti',
+        value: chunk,
+        inline: false,
+      });
+    });
+  }
+
   const embed = {
     title: title || 'Traccia in ascolto',
     url: url || undefined,
@@ -100,14 +151,27 @@ async function sendToDiscord({ url, title, average, count }) {
         ? `⭐ **Voto medio: ${average.toFixed(1)} / 10** (${count} vot${count === 1 ? 'o' : 'i'})`
         : '⭐ Nessun voto ricevuto per questo brano.',
     color: 0x9146ff, // viola Twitch
+    fields,
     timestamp: new Date().toISOString(),
   };
 
-  await fetch(DISCORD_WEBHOOK_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ embeds: [embed] }),
-  });
+  try {
+    const res = await fetch(DISCORD_WEBHOOK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ embeds: [embed] }),
+    });
+
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      console.error(`❌ Discord ha rifiutato il webhook (${res.status}):`, body);
+    }
+  } catch (err) {
+    // Non rilanciare l'errore: se questa fetch fallisce, non deve MAI
+    // far crashare il processo (un errore async non gestito qui
+    // ucciderebbe l'intero server su Node moderno).
+    console.error('❌ Errore di rete inviando il webhook Discord:', err);
+  }
 }
 
 // ---------- Server HTTP per il trigger locale ----------
@@ -161,23 +225,33 @@ app.post('/trigger', async (req, res) => {
     res.status(200).send('Sondaggio avviato');
 
     setTimeout(async () => {
-      pollActive = false;
-      pollInfo = null;
+      // TUTTO qui dentro è avvolto in try/catch: se qualcosa fallisce
+      // (chat, Discord, qualsiasi cosa) il server NON deve crashare.
+      // Un errore async non gestito in un setTimeout può far terminare
+      // l'intero processo Node — e su Render questo si traduce in un
+      // riavvio silenzioso, senza che nessuno se ne accorga.
+      try {
+        pollActive = false;
+        pollInfo = null;
 
-      const { count, average } = currentStats();
+        const { count, average } = currentStats();
+        const voteEntries = currentVoteEntries();
 
-      if (count > 0) {
-        await twitchClient.say(
-          process.env.TWITCH_CHANNEL,
-          `📊 Voto medio: ${average.toFixed(1)}/10 su ${count} vot${count === 1 ? 'o' : 'i'}!`
-        );
-      } else {
-        await twitchClient.say(process.env.TWITCH_CHANNEL, '📊 Nessun voto ricevuto stavolta 😅');
+        if (count > 0) {
+          await twitchClient.say(
+            process.env.TWITCH_CHANNEL,
+            `📊 Voto medio: ${average.toFixed(1)}/10 su ${count} vot${count === 1 ? 'o' : 'i'}!`
+          );
+        } else {
+          await twitchClient.say(process.env.TWITCH_CHANNEL, '📊 Nessun voto ricevuto stavolta 😅');
+        }
+
+        broadcastOverlay({ type: 'poll_end', count, average });
+
+        await sendToDiscord({ url: browserUrl, title: finalTitle, average, count, voteEntries });
+      } catch (err) {
+        console.error('❌ Errore durante la chiusura del sondaggio:', err);
       }
-
-      broadcastOverlay({ type: 'poll_end', count, average });
-
-      await sendToDiscord({ url: browserUrl, title: finalTitle, average, count });
     }, POLL_DURATION_SECONDS * 1000);
   } catch (err) {
     pollActive = false;
@@ -317,7 +391,7 @@ app.get('/overlay', (req, res) => {
   const barFill = document.getElementById('barFill');
   const timerEl = document.getElementById('timer');
 
-  let durationSeconds = 60;
+  let durationSeconds = 120;
   let secondsLeft = 0;
   let countdownInterval = null;
 
