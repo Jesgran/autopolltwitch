@@ -234,7 +234,7 @@ app.post('/trigger', async (req, res) => {
     // Uso di /announce per evidenziare il messaggio in chat
     await twitchClient.say(
       process.env.TWITCH_CHANNEL,
-      `/announce 🎵 Vota il brano da 1 a 10 scrivendo v seguito dal numero, decimali ammessi (es. v9 o v6.7)! Avete ${POLL_DURATION_SECONDS} secondi ⏳`
+      `/announce 🎵 Vota il brano da 1 a 10 scrivendo v seguito dal numero (es. v9), decimali ammessi con il punto (es. v6.7)! Avete ${POLL_DURATION_SECONDS} secondi ⏳`
     );
 
     broadcastOverlay({
