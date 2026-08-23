@@ -61,59 +61,41 @@ function currentVoteEntries() {
     .sort((a, b) => b.value - a.value);
 }
 
+// Avvolge una promise con un timeout: se non risponde entro "ms",
+// la promise viene rigettata invece di restare appesa per sempre.
+// Non annulla la richiesta di rete sottostante, ma ci permette di NON
+// bloccare mai l'avvio del server o loggare "non succede niente".
+function withTimeout(promise, ms, label) {
+  let timeoutId;
+  const timeout = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => reject(new Error(`Timeout dopo ${ms / 1000}s (${label})`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timeoutId));
+}
+
 // ---------- Client Discord (REST ufficiale, gestisce header/rate-limit da sola) ----------
 const discordRest = new REST({ version: '10' }).setToken(DISCORD_BOT_TOKEN);
 
-// ---------- Client Twitch ----------
-const twitchClient = new tmi.Client({
-  identity: {
-    username: process.env.TWITCH_BOT_USERNAME,
-    password: process.env.TWITCH_OAUTH_TOKEN,
-  },
-  channels: [process.env.TWITCH_CHANNEL],
-});
-
-twitchClient.on('message', (channel, tags, message, self) => {
-  if (self || !pollActive) return;
-
-  const match = message.trim().match(/^v(10(?:\.0)?|[1-9](?:\.\d)?)$/i);
-  if (!match) return;
-
-  const value = Number.parseFloat(match[1]);
-  const user = (tags['display-name'] || tags.username || '').toLowerCase();
-  if (!user) return;
-
-  votes.set(user, value); // un voto per utente, l'ultimo scritto vince
-
-  const { count, average } = currentStats();
-  broadcastOverlay({ type: 'vote_update', count, average });
-});
-
-await twitchClient.connect();
-console.log('✅ Bot Twitch connesso al canale', process.env.TWITCH_CHANNEL);
-// Da qui in poi il bot resta connesso in permanenza: su Render non serve
-// che nessuno lo avvii manualmente ogni volta che si va in live.
-
-// ---------- Verifica del bot Discord all'avvio ----------
-// Il bot Discord non ha una "connessione" persistente (usiamo solo REST,
-// niente gateway), quindi senza questo controllo non sapresti se il
-// token/canale sono corretti finché non finisce il primo sondaggio.
-// Qui invece lo verifichiamo subito e logghiamo il risultato chiaramente.
+// Verifica il bot Discord: token valido + accesso al canale. Chiamata
+// DOPO che il server è già in ascolto, mai prima (vedi app.listen sotto).
 async function checkDiscordBot() {
   try {
-    const me = await discordRest.get('/users/@me');
+    const me = await withTimeout(discordRest.get('/users/@me'), 10000, 'verifica token Discord');
     console.log(`✅ Bot Discord autenticato come ${me.username}`);
   } catch (err) {
     console.error(
-      `❌ DISCORD_BOT_TOKEN non valido (${err.status || err.code || 'errore'}). Controlla il token su ` +
-        `discord.com/developers/applications → tua app → Bot → Reset Token.`,
-      err.message || err
+      `❌ DISCORD_BOT_TOKEN non valido o Discord irraggiungibile (${err.status || err.code || err.message || 'errore'}). ` +
+        `Controlla il token su discord.com/developers/applications → tua app → Bot → Reset Token.`
     );
     return;
   }
 
   try {
-    const channel = await discordRest.get(`/channels/${DISCORD_CHANNEL_ID}`);
+    const channel = await withTimeout(
+      discordRest.get(`/channels/${DISCORD_CHANNEL_ID}`),
+      10000,
+      'verifica canale Discord'
+    );
     console.log(`✅ Bot Discord ha accesso al canale #${channel.name || DISCORD_CHANNEL_ID}`);
   } catch (err) {
     if (err.status === 404) {
@@ -128,31 +110,12 @@ async function checkDiscordBot() {
           `Controlla i permessi del canale o del ruolo assegnato al bot (serve "Send Messages").`
       );
     } else {
-      console.error(`❌ Errore controllando l'accesso al canale Discord (${err.status || 'errore'}):`, err.message || err);
+      console.error(
+        `❌ Errore controllando l'accesso al canale Discord (${err.status || err.message || 'errore'})`
+      );
     }
   }
 }
-
-await checkDiscordBot();
-
-// ---------- Titolo YouTube via oEmbed (più pulito del titolo della tab) ----------
-async function getYoutubeTitle(url) {
-  try {
-    const isYoutube = /youtube\.com\/watch|youtu\.be\//.test(url);
-    if (!isYoutube) return null;
-
-    const oembedUrl = `https://www.youtube.com/oembed?url=${encodeURIComponent(url)}&format=json`;
-    const res = await fetch(oembedUrl);
-    if (!res.ok) return null;
-
-    const data = await res.json();
-    return data.title || null;
-  } catch {
-    return null;
-  }
-}
-
-// ---------- Invio a Discord ----------
 
 // I campi degli embed Discord hanno un limite di 1024 caratteri: se i
 // votanti sono tanti, spezzo la lista in più campi "Voti (1/2)", "Voti (2/2)" ecc.
@@ -207,17 +170,61 @@ async function sendToDiscord({ url, title, average, count, voteEntries }) {
     // @discordjs/rest gestisce da sola: header corretti (incluso lo
     // User-Agent che Discord richiede), tracking dei bucket di
     // rate-limit per endpoint, e retry automatico sui 429.
-    await discordRest.post(`/channels/${DISCORD_CHANNEL_ID}/messages`, {
-      body: { embeds: [embed] },
-    });
+    await withTimeout(
+      discordRest.post(`/channels/${DISCORD_CHANNEL_ID}/messages`, { body: { embeds: [embed] } }),
+      10000,
+      'invio messaggio Discord'
+    );
     console.log('✅ Messaggio inviato su Discord con successo');
   } catch (err) {
     // Non rilanciare l'errore: se questa chiamata fallisce, non deve MAI
     // far crashare il processo (un errore async non gestito qui
     // ucciderebbe l'intero server su Node moderno).
-    console.error(`❌ Discord ha rifiutato il messaggio (${err.status || err.code || 'errore'}):`, err.message || err);
+    console.error(`❌ Discord ha rifiutato il messaggio (${err.status || err.message || 'errore'})`);
   }
 }
+
+// ---------- Titolo YouTube via oEmbed (più pulito del titolo della tab) ----------
+async function getYoutubeTitle(url) {
+  try {
+    const isYoutube = /youtube\.com\/watch|youtu\.be\//.test(url);
+    if (!isYoutube) return null;
+
+    const oembedUrl = `https://www.youtube.com/oembed?url=${encodeURIComponent(url)}&format=json`;
+    const res = await withTimeout(fetch(oembedUrl), 5000, 'oEmbed YouTube');
+    if (!res.ok) return null;
+
+    const data = await res.json();
+    return data.title || null;
+  } catch {
+    return null;
+  }
+}
+
+// ---------- Client Twitch ----------
+const twitchClient = new tmi.Client({
+  identity: {
+    username: process.env.TWITCH_BOT_USERNAME,
+    password: process.env.TWITCH_OAUTH_TOKEN,
+  },
+  channels: [process.env.TWITCH_CHANNEL],
+});
+
+twitchClient.on('message', (channel, tags, message, self) => {
+  if (self || !pollActive) return;
+
+  const match = message.trim().match(/^v(10(?:\.0)?|[1-9](?:\.\d)?)$/i);
+  if (!match) return;
+
+  const value = Number.parseFloat(match[1]);
+  const user = (tags['display-name'] || tags.username || '').toLowerCase();
+  if (!user) return;
+
+  votes.set(user, value); // un voto per utente, l'ultimo scritto vince
+
+  const { count, average } = currentStats();
+  broadcastOverlay({ type: 'vote_update', count, average });
+});
 
 // ---------- Server HTTP per il trigger locale ----------
 const app = express();
@@ -485,7 +492,22 @@ app.get('/overlay', (req, res) => {
 </html>`);
 });
 
+// ---------- Avvio del server ----------
+// IMPORTANTE: la porta si apre PRIMA di qualsiasi connessione a Twitch o
+// Discord. Render considera il servizio "vivo" solo quando la porta è
+// aperta: se una chiamata di rete verso servizi esterni si blocca prima
+// di questa riga, Render resta in attesa per sempre ("No open ports
+// detected") anche se il resto del codice è corretto. Twitch e Discord
+// si connettono DOPO, in modo che un loro eventuale blocco non impedisca
+// mai al server di avviarsi.
 app.listen(PORT, () => {
   console.log(`✅ Server in ascolto su http://localhost:${PORT}`);
   console.log(`   Punta lo Stream Deck su: http://localhost:${PORT}/trigger`);
+
+  twitchClient
+    .connect()
+    .then(() => console.log('✅ Bot Twitch connesso al canale', process.env.TWITCH_CHANNEL))
+    .catch((err) => console.error('❌ Bot Twitch non riuscito a connettersi:', err.message || err));
+
+  checkDiscordBot();
 });
